@@ -12,7 +12,7 @@ on:
       kernel_repo:
         description: 'Kernel source repo (user/repo)'
         required: true
-        default: 'your-github-user/android_kernel_device_msm-5.15'
+        default: 'alghiffaryfa19/android_kernel_common'
       kernel_branch:
         description: 'Kernel branch'
         required: true
