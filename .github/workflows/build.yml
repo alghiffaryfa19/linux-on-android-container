@@ -76,7 +76,7 @@ jobs:
 
       - name: Clone kernel source
         run: |
-          KERNEL_REPO="${{ github.event.inputs.kernel_repo || 'your-github-user/android_kernel_device' }}"
+          KERNEL_REPO="${{ github.event.inputs.kernel_repo || 'alghiffaryfa19/android_kernel_common' }}"
           KERNEL_BRANCH="${{ github.event.inputs.kernel_branch || 'android13-5.15' }}"
           echo "Cloning $KERNEL_REPO @ $KERNEL_BRANCH"
           git clone --depth=1 \
