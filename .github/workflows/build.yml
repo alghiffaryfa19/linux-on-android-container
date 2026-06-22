@@ -1,0 +1,345 @@
+name: Build Lindroid Full Package
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel source repo (user/repo)'
+        required: true
+        default: 'your-github-user/android_kernel_device_msm-5.15'
+      kernel_branch:
+        description: 'Kernel branch'
+        required: true
+        default: 'android13-5.15'
+      kernel_defconfig:
+        description: 'Kernel defconfig'
+        required: true
+        default: 'vendor/your_device_defconfig'
+      device_codename:
+        description: 'Device codename (untuk nama file output)'
+        required: true
+        default: 'devicename'
+
+env:
+  # Clang versi untuk GKI 5.15
+  CLANG_VERSION: r450784d
+  # Repo lindroid
+  VENDOR_LINDROID_REPO: Linux-on-droid/vendor_lindroid
+  EVDI_DRIVER_REPO: Linux-on-droid/lindroid-drm-loopback
+  LIBHYBRIS_REPO: Linux-on-droid/libhybris
+  EXTERNAL_LXC_REPO: Linux-on-droid/external_lxc
+
+jobs:
+  # ────────────────────────────────────────────────────────
+  # JOB 1: Build EVDI DLKM kernel module
+  # ────────────────────────────────────────────────────────
+  build-evdi-dlkm:
+    name: Build EVDI DLKM (.ko)
+    runs-on: ubuntu-22.04
+    outputs:
+      ko_artifact: ${{ steps.upload.outputs.artifact-id }}
+
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git make python3 bc flex bison \
+            libssl-dev libelf-dev pahole \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            lld llvm clang zip unzip curl wget ca-certificates \
+            libncurses-dev gawk openssl dwarves
+
+      - name: Setup AOSP Clang ${{ env.CLANG_VERSION }}
+        run: |
+          mkdir -p $HOME/clang
+          # Download clang prebuilt dari AOSP (via Google storage)
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-${CLANG_VERSION}.tar.gz"
+          # Fallback: pakai clang dari apt jika download gagal
+          if ! curl -fsSL "$CLANG_URL" -o /tmp/clang.tar.gz 2>/dev/null; then
+            echo "AOSP clang download gagal, pakai system clang"
+            echo "CLANG_BIN=/usr/bin" >> $GITHUB_ENV
+          else
+            tar -xzf /tmp/clang.tar.gz -C $HOME/clang
+            echo "CLANG_BIN=$HOME/clang/bin" >> $GITHUB_ENV
+          fi
+          clang --version
+
+      - name: Clone kernel source
+        run: |
+          KERNEL_REPO="${{ github.event.inputs.kernel_repo || 'your-github-user/android_kernel_device' }}"
+          KERNEL_BRANCH="${{ github.event.inputs.kernel_branch || 'android13-5.15' }}"
+          echo "Cloning $KERNEL_REPO @ $KERNEL_BRANCH"
+          git clone --depth=1 \
+            --branch "$KERNEL_BRANCH" \
+            "https://github.com/$KERNEL_REPO" \
+            kernel-source
+          echo "Kernel version: $(make -C kernel-source kernelversion 2>/dev/null || echo 'unknown')"
+
+      - name: Clone EVDI driver source
+        run: |
+          git clone --depth=1 \
+            https://github.com/${{ env.EVDI_DRIVER_REPO }} \
+            evdi-driver
+
+      - name: Configure kernel (minimal untuk DLKM build)
+        run: |
+          cd kernel-source
+          DEFCONFIG="${{ github.event.inputs.kernel_defconfig || 'gki_defconfig' }}"
+          make ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- \
+               "$DEFCONFIG" 2>&1 | tail -5
+          # Pastikan config DRM ada (wajib untuk EVDI)
+          scripts/config --enable CONFIG_DRM
+          scripts/config --enable CONFIG_DRM_KMS_HELPER
+          scripts/config --enable CONFIG_DRM_FBDEV_EMULATION
+          make ARCH=arm64 CC=clang olddefconfig 2>&1 | tail -3
+
+      - name: Build kernel headers (dibutuhkan untuk DLKM)
+        run: |
+          cd kernel-source
+          make ARCH=arm64 \
+               CC=clang \
+               CROSS_COMPILE=aarch64-linux-gnu- \
+               LLVM=1 LLVM_IAS=1 \
+               -j$(nproc) \
+               scripts prepare modules_prepare 2>&1 | tail -20
+
+      - name: Build EVDI DLKM
+        run: |
+          mkdir -p out/evdi
+          cp scripts/build_evdi_dlkm.sh out/build_evdi.sh
+          chmod +x out/build_evdi.sh
+
+          # Buat Makefile override untuk GKI 5.15
+          cp evdi-driver/Makefile evdi-driver/Makefile.orig
+          cat > evdi-driver/Makefile << 'MKEOF'
+          ccflags-y += -DEVDI_HAVE_XARRAY=1
+          ccflags-y += -DEVDI_HAVE_ATOMIC_HELPERS=1
+          ccflags-y += -DEVDI_HAVE_DRM_MANAGED=1
+          ccflags-y += -DEVDI_HAVE_KMS_HELPER=1
+          ccflags-y += -DEVDI_HAVE_DRM_OPEN_CLOSE=1
+          ccflags-y += -isystem $(src)/uapi
+          evdi-lindroid-y := evdi_connector.o evdi_event.o evdi_fb.o \
+                             evdi_gem.o evdi_ioctl.o evdi_lindroid_drv.o \
+                             evdi_modeset.o evdi_sysfs.o
+          obj-m := evdi-lindroid.o
+          MKEOF
+
+          make -C kernel-source \
+               M=$(pwd)/evdi-driver \
+               ARCH=arm64 \
+               CC=clang \
+               LD=ld.lld \
+               AR=llvm-ar \
+               NM=llvm-nm \
+               OBJCOPY=llvm-objcopy \
+               OBJDUMP=llvm-objdump \
+               READELF=llvm-readelf \
+               CROSS_COMPILE=aarch64-linux-gnu- \
+               CLANG_TRIPLE=aarch64-linux-gnu- \
+               LLVM=1 LLVM_IAS=1 \
+               CONFIG_MODULE_SIG= \
+               CONFIG_MODULE_SIG_ALL= \
+               -j$(nproc) \
+               modules 2>&1
+
+          # Cek hasil
+          find evdi-driver -name "*.ko" -exec cp {} out/evdi/ \;
+          ls -lh out/evdi/*.ko
+
+      - name: Strip debug symbols
+        run: |
+          for ko in out/evdi/*.ko; do
+            cp "$ko" "${ko%.ko}-debug.ko"
+            llvm-strip --strip-debug "$ko" 2>/dev/null || true
+            echo "$(basename $ko): $(du -sh $ko | cut -f1)"
+          done
+
+      - name: Upload EVDI .ko artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: evdi-dlkm-ko
+          path: out/evdi/
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────
+  # JOB 2: Build SEPolicy
+  # ────────────────────────────────────────────────────────
+  build-sepolicy:
+    name: Compile & Merge SEPolicy
+    runs-on: ubuntu-22.04
+    outputs:
+      sepolicy_artifact: ${{ steps.upload-sep.outputs.artifact-id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install SELinux tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            selinux-utils checkpolicy policycoreutils \
+            python3 python3-pip curl git zip
+
+      - name: Clone vendor_lindroid (untuk sepolicy/*.te)
+        run: |
+          git clone --depth=1 \
+            https://github.com/${{ env.VENDOR_LINDROID_REPO }} \
+            vendor_lindroid
+
+      - name: Verify sepolicy source
+        run: |
+          echo "Sepolicy files:"
+          ls vendor_lindroid/sepolicy/ 2>/dev/null || \
+            (echo "WARNING: sepolicy dir tidak ditemukan" && \
+             ls vendor_lindroid/ && exit 1)
+
+      - name: Compile & merge sepolicy
+        run: |
+          chmod +x scripts/build_sepolicy.sh
+          ./scripts/build_sepolicy.sh \
+            --te-dir vendor_lindroid/sepolicy \
+            --output out/sepolicy
+
+      - name: Upload SEPolicy artifact
+        id: upload-sep
+        uses: actions/upload-artifact@v4
+        with:
+          name: lindroid-sepolicy
+          path: out/sepolicy/
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────
+  # JOB 3: Download LXC + libhybris prebuilts
+  # ────────────────────────────────────────────────────────
+  fetch-prebuilts:
+    name: Fetch LXC + libhybris prebuilts
+    runs-on: ubuntu-22.04
+    outputs:
+      prebuilts_artifact: ${{ steps.upload-pb.outputs.artifact-id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch prebuilts from Linux-on-droid releases
+        run: |
+          chmod +x scripts/fetch_prebuilts.sh
+          ./scripts/fetch_prebuilts.sh --output out/prebuilts
+
+      - name: Upload prebuilts artifact
+        id: upload-pb
+        uses: actions/upload-artifact@v4
+        with:
+          name: lindroid-prebuilts
+          path: out/prebuilts/
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────
+  # JOB 4: Package — gabungkan semua jadi 2 ZIP
+  # ────────────────────────────────────────────────────────
+  package:
+    name: Package TWRP + Magisk ZIP
+    runs-on: ubuntu-22.04
+    needs: [build-evdi-dlkm, build-sepolicy, fetch-prebuilts]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get install -y zip unzip
+
+      - name: Download semua artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Show artifacts
+        run: find artifacts/ -type f | sort
+
+      - name: Package TWRP flashable ZIP
+        run: |
+          chmod +x scripts/package_twrp.sh
+          DEVICE="${{ github.event.inputs.device_codename || 'generic' }}"
+          ./scripts/package_twrp.sh \
+            --evdi    artifacts/evdi-dlkm-ko/ \
+            --sepolicy artifacts/lindroid-sepolicy/ \
+            --prebuilts artifacts/lindroid-prebuilts/ \
+            --device  "$DEVICE" \
+            --output  out/
+
+      - name: Package Magisk module ZIP
+        run: |
+          chmod +x scripts/package_magisk.sh
+          DEVICE="${{ github.event.inputs.device_codename || 'generic' }}"
+          ./scripts/package_magisk.sh \
+            --evdi    artifacts/evdi-dlkm-ko/ \
+            --prebuilts artifacts/lindroid-prebuilts/ \
+            --device  "$DEVICE" \
+            --output  out/
+
+      - name: Show output ZIPs
+        run: |
+          echo "=== Output files ==="
+          ls -lh out/*.zip
+          echo ""
+          echo "=== TWRP ZIP contents ==="
+          unzip -l out/lindroid-twrp-*.zip | head -40
+          echo ""
+          echo "=== Magisk ZIP contents ==="
+          unzip -l out/lindroid-magisk-*.zip | head -40
+
+      - name: Upload TWRP ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: lindroid-twrp-flashable
+          path: out/lindroid-twrp-*.zip
+
+      - name: Upload Magisk ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: lindroid-magisk-module
+          path: out/lindroid-magisk-*.zip
+
+      - name: Create GitHub Release (hanya saat push tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            out/lindroid-twrp-*.zip
+            out/lindroid-magisk-*.zip
+          body: |
+            ## Lindroid Full Package ${{ github.ref_name }}
+
+            ### Isi
+            - **TWRP ZIP**: EVDI DLKM driver + SEPolicy + LXC + libhybris
+            - **Magisk Module**: LXC + libhybris + EVDI DLKM loader
+
+            ### Cara install
+            **Via TWRP** (dianjurkan untuk SEPolicy):
+            1. Flash `lindroid-twrp-*.zip` via TWRP
+            2. Reboot ke Android
+            3. Flash `lindroid-magisk-*.zip` via Magisk (untuk module management)
+
+            **Via Magisk saja** (tanpa SEPolicy):
+            1. Flash `lindroid-magisk-*.zip` via Magisk
+            2. Reboot
+
+            ### Persyaratan
+            - Android 15, arm64
+            - Kernel 5.15 GKI dengan config Lindroid
+            - TWRP atau Magisk terinstall
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
